@@ -83,6 +83,41 @@ gamestat -o FILE           # choose the output path
 
 The report is written to `~/.cache/gamestat/report.html` by default.
 
+## Uninstalling games
+
+`gamestat uninstall "<game>"` removes a game through its launcher's real
+mechanism — it isn't a blind `rm -rf`.
+
+```
+gamestat uninstall "Assetto Corsa"            # prompts, then removes
+gamestat uninstall "Hogwarts" --dry-run       # preview exactly what's removed
+gamestat uninstall 244210                     # by Steam appid
+gamestat uninstall "Fortnite" --via-launcher  # hand off to the launcher's own uninstaller
+gamestat uninstall "<game>" --yes             # skip the confirmation prompt
+```
+
+What it does per launcher:
+
+- **Steam** — deletes the install folder, `appmanifest_<appid>.acf`, and (unless
+  `--keep-compat`) the Proton prefix + shader cache. Steam then correctly sees
+  the game as uninstalled.
+- **Lutris** — deletes the install folder and marks the entry uninstalled in
+  Lutris (playtime is kept).
+- **Epic / GOG / Amazon (Heroic)** — deletes the folder and removes the entry
+  from Heroic. With `--via-launcher` it runs `legendary uninstall` if available.
+- **Windows launchers** — deletes the install folder, or with `--via-launcher`
+  runs the registered native uninstaller (`UninstallString`).
+
+Safety:
+
+- **Dry-run friendly** — always prints the exact paths and reclaimable size
+  first; `--dry-run` deletes nothing.
+- **Confirmation prompt** before anything is deleted (skip with `--yes`).
+- **Refuses to run while the launcher is open** (Steam rewrites manifests if it's
+  running); override with `--force`.
+- **Path guards** refuse to delete your home folder, a filesystem root, or any
+  suspiciously shallow path.
+
 ## How it works
 
 Everything comes from each launcher's own local files — no logins, no API keys.

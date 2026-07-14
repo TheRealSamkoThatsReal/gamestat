@@ -13,11 +13,13 @@ launchers that record it locally (Steam and Lutris); others rank by size /
 recency and show "—" for playtime.
 
 Usage:
-    gamestat                # scan, write report, open in browser
-    gamestat --no-open      # just write the report, print its path
-    gamestat --all          # include Proton / runtimes / redistributables
+    gamestat                     # scan, write report, open in browser
+    gamestat --no-open           # just write the report, print its path
+    gamestat --all               # include Proton / runtimes / redistributables
     gamestat --only steam,epic   # limit to specific launchers
-    gamestat -o FILE.html   # choose the output path
+    gamestat -o FILE.html        # choose the output path
+    gamestat uninstall "<game>"  # remove a game via its launcher (guarded)
+    gamestat uninstall "<game>" --dry-run   # preview what would be deleted
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import webbrowser
@@ -213,7 +216,8 @@ def _merge_playtime(text: str, out: dict[int, dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def rec(source: str, name: str, size, playtime_min=0, has_playtime=False,
-        last_played=0, *, art="", appid=0, tool=False) -> dict:
+        last_played=0, *, art="", appid=0, tool=False, install_dir="",
+        app_name="", uninstall_cmd="") -> dict:
     """Normalized game record shared by every provider."""
     return {
         "source": source,
@@ -225,6 +229,9 @@ def rec(source: str, name: str, size, playtime_min=0, has_playtime=False,
         "art": art or "",                             # explicit cover URL
         "appid": int(appid or 0),                     # Steam appid → CDN art
         "tool": bool(tool),
+        "install_dir": str(install_dir or ""),        # for uninstall
+        "app_name": str(app_name or ""),              # launcher-internal id
+        "uninstall_cmd": str(uninstall_cmd or ""),    # native uninstaller (Windows)
     }
 
 
@@ -295,7 +302,7 @@ def scan_steam(include_tools: bool) -> list[dict]:
             "Steam", g["name"], g["size"],
             pt.get("playtime", 0), True,
             max(g["last_played"], pt.get("last_played", 0)),
-            appid=appid, tool=is_tool,
+            appid=appid, tool=is_tool, install_dir=g["installdir"],
         ))
     return rows
 
@@ -335,6 +342,7 @@ def scan_lutris() -> list[dict]:
                 rows.append(rec(
                     "Lutris", name or slug or "Unknown", size,
                     int(round((playtime or 0) * 60)), True, lastplayed or 0, art=art,
+                    install_dir=directory or "", app_name=slug or "",
                 ))
         finally:
             con.close()
@@ -373,7 +381,8 @@ def scan_heroic() -> list[dict]:
                 size = dir_size(Path(inst["install_path"]))
             art = g.get("art_square") or g.get("art_cover") or ""
             last = iso_unix((ts.get(app) or {}).get("firstPlayed"))
-            rows.append(rec(label, g.get("title", app), size, 0, False, last, art=art))
+            rows.append(rec(label, g.get("title", app), size, 0, False, last, art=art,
+                            install_dir=inst.get("install_path", ""), app_name=app))
     return rows
 
 
@@ -428,7 +437,8 @@ def scan_epic_windows() -> list[dict]:
         loc = d.get("InstallLocation", "")
         size = int(d.get("InstallSize", 0)) or (dir_size(Path(loc)) if loc else 0)
         rows.append(rec("Epic", d.get("DisplayName", d.get("AppName", "?")),
-                        size, 0, False, 0))
+                        size, 0, False, 0, install_dir=loc,
+                        app_name=d.get("AppName", "")))
     return rows
 
 
@@ -441,7 +451,7 @@ def scan_gog_windows() -> list[dict]:
             name = _winreg_val(key, "gameName") or "?"
             path = _winreg_val(key, "path")
             size = dir_size(Path(path)) if path else 0
-            rows.append(rec("GOG", name, size, 0, False, 0))
+            rows.append(rec("GOG", name, size, 0, False, 0, install_dir=path or ""))
         finally:
             winreg.CloseKey(key)
     return rows
@@ -458,7 +468,7 @@ def scan_ubisoft_windows() -> list[dict]:
                 continue
             p = Path(path)
             rows.append(rec("Ubisoft", p.name or "Ubisoft game",
-                            dir_size(p), 0, False, 0))
+                            dir_size(p), 0, False, 0, install_dir=path))
         finally:
             winreg.CloseKey(key)
     return rows
@@ -485,7 +495,9 @@ def _scan_uninstall_by_publisher(labels: dict) -> list[dict]:
                 loc = _winreg_val(key, "InstallLocation")
                 if not name or not loc or not Path(loc).is_dir():
                     continue
-                rows.append(rec(source, name, dir_size(Path(loc)), 0, False, 0))
+                rows.append(rec(source, name, dir_size(Path(loc)), 0, False, 0,
+                                install_dir=loc,
+                                uninstall_cmd=_winreg_val(key, "UninstallString") or ""))
             finally:
                 winreg.CloseKey(key)
     return rows
@@ -512,7 +524,8 @@ def scan_riot_windows() -> list[dict]:
             if not game_dir.is_dir() or str(game_dir) in seen:
                 continue
             seen.add(str(game_dir))
-            rows.append(rec("Riot", game_dir.name, dir_size(game_dir), 0, False, 0))
+            rows.append(rec("Riot", game_dir.name, dir_size(game_dir), 0, False, 0,
+                            install_dir=str(game_dir)))
     return rows
 
 
@@ -582,6 +595,265 @@ def collect(include_tools: bool, only: set[str] | None = None) -> tuple[list[dic
         "errors": errors,
     }
     return deduped, meta
+
+
+# ---------------------------------------------------------------------------
+# Uninstall — route through each launcher's real mechanism, with guards
+# ---------------------------------------------------------------------------
+
+def fmt_bytes(b: int) -> str:
+    b = float(b)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024 or u == "TB":
+            return f"{b:.1f} {u}" if (u != "B" and b < 10) else f"{b:.0f} {u}"
+        b /= 1024
+    return f"{b:.0f} TB"
+
+
+def resolve_games(games: list[dict], query: str) -> list[dict]:
+    """Match a game by Steam appid, then exact name, then substring."""
+    q = query.strip().lower()
+    if q.isdigit():
+        hit = [g for g in games if str(g["appid"]) == q]
+        if hit:
+            return hit
+    exact = [g for g in games if g["name"].lower() == q]
+    return exact or [g for g in games if q in g["name"].lower()]
+
+
+def _running_processes() -> set[str]:
+    """Best-effort set of lowercase running process names. Empty = 'unknown'."""
+    names: set[str] = set()
+    proc = Path("/proc")
+    if proc.is_dir():                       # Linux
+        for p in proc.iterdir():
+            if p.name.isdigit():
+                try:
+                    names.add((p / "comm").read_text().strip().lower())
+                except OSError:
+                    pass
+        return names
+    try:                                    # macOS / other
+        import subprocess
+        out = subprocess.run(["ps", "-Ao", "comm"], capture_output=True,
+                             text=True, timeout=5).stdout
+        names = {Path(l.strip()).name.lower() for l in out.splitlines()}
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+_LAUNCHER_PROCS = {
+    "Steam": ("steam",), "Lutris": ("lutris",),
+    "Epic": ("heroic",), "GOG": ("heroic",), "Amazon": ("heroic",),
+}
+
+
+def launcher_running(source: str) -> bool:
+    procs = _running_processes()
+    if not procs:
+        return False                        # couldn't determine — don't block
+    return any(w in p for w in _LAUNCHER_PROCS.get(source, ()) for p in procs)
+
+
+def safe_target(p: Path) -> bool:
+    """Guard against catastrophic deletes (home, root, very shallow paths)."""
+    try:
+        p = p.resolve()
+    except OSError:
+        return False
+    if not p.exists():
+        return False
+    return p != Path.home() and p != Path(p.anchor) and len(p.parts) >= 3
+
+
+def steam_extra_paths(appid: int, keep_compat: bool) -> list[Path]:
+    """The appmanifest plus Proton prefix / shader cache / partial downloads."""
+    out: list[Path] = []
+    root = find_steam_root()
+    for lib in (library_paths(root) if root else []):
+        apps = lib / "steamapps"
+        mf = apps / f"appmanifest_{appid}.acf"
+        if mf.exists():
+            out.append(mf)
+            if not keep_compat:
+                for sub in (f"compatdata/{appid}", f"shadercache/{appid}",
+                            f"downloading/{appid}"):
+                    d = apps / sub
+                    if d.exists():
+                        out.append(d)
+            break
+    return out
+
+
+def build_plan(g: dict, keep_compat: bool = False) -> dict:
+    """Compute the removal plan for a game record."""
+    src = g["source"]
+    inst = Path(g["install_dir"]) if g["install_dir"] else None
+    paths: list[Path] = []
+    notes: list[str] = []
+    method = "files"
+    if inst:
+        paths.append(inst)
+    if src == "Steam":
+        method = "steam"
+        paths += steam_extra_paths(g["appid"], keep_compat)
+    elif src == "Lutris":
+        method = "lutris"
+        notes.append("Marks the Lutris entry uninstalled (playtime kept).")
+    elif src in ("Epic", "GOG", "Amazon") and _heroic_base():
+        method = "heroic"
+        notes.append(f"Removes the folder and the {src} entry from Heroic.")
+    elif g.get("uninstall_cmd"):
+        notes.append("A native uninstaller exists — use --via-launcher to run it.")
+    reclaim = sum((dir_size(p) if p.is_dir() else p.stat().st_size)
+                  for p in paths if p.exists())
+    return {"method": method, "paths": paths, "notes": notes, "reclaim": reclaim}
+
+
+def remove_paths(paths: list[Path], dry_run: bool) -> int:
+    """Delete the given paths (dirs recursively). Returns bytes freed."""
+    freed = 0
+    for p in paths:
+        if not p.exists():
+            continue
+        if not safe_target(p):
+            print(f"  ⚠  refusing unsafe path: {p}", file=sys.stderr)
+            continue
+        sz = dir_size(p) if p.is_dir() else p.stat().st_size
+        line = f"{fmt_bytes(sz):>10}  {p}"
+        if dry_run:
+            print(f"  would remove  {line}")
+            freed += sz
+            continue
+        try:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            freed += sz
+            print(f"  removed       {line}")
+        except OSError as e:
+            print(f"  !  failed {p}: {e}", file=sys.stderr)
+    return freed
+
+
+def _lutris_mark_uninstalled(slug: str) -> None:
+    import sqlite3
+    for db in (Path.home() / ".local/share/lutris/pga.db",
+               Path.home() / ".var/app/net.lutris.Lutris/data/lutris/pga.db"):
+        if not db.exists():
+            continue
+        try:
+            con = sqlite3.connect(db)
+            con.execute("UPDATE games SET installed=0 WHERE slug=?", (slug,))
+            con.commit()
+            con.close()
+        except sqlite3.Error:
+            pass
+
+
+def _heroic_forget(source: str, app_name: str) -> None:
+    base = _heroic_base()
+    if not base or not app_name:
+        return
+    files = {"Epic": "legendaryConfig/legendary/installed.json",
+             "GOG": "gog_store/installed.json",
+             "Amazon": "nile_store/installed.json"}
+    f = base / files.get(source, "")
+    data = _load_json(f)
+    if isinstance(data, dict) and app_name in data:
+        data.pop(app_name, None)
+        try:
+            f.write_text(json.dumps(data, indent=2))
+        except OSError:
+            pass
+
+
+def via_launcher(g: dict) -> bool:
+    """Hand off to the launcher's own uninstaller. Returns True if launched."""
+    src = g["source"]
+    if src == "Steam" and g["appid"]:
+        print(f"Opening Steam's uninstaller for appid {g['appid']}…")
+        webbrowser.open(f"steam://uninstall/{g['appid']}")
+        return True
+    if src in ("Epic", "GOG", "Amazon") and shutil.which("legendary") and g["app_name"]:
+        import subprocess
+        print(f"Running: legendary uninstall {g['app_name']}")
+        subprocess.run(["legendary", "uninstall", g["app_name"]], check=False)
+        return True
+    if g.get("uninstall_cmd"):
+        import subprocess
+        print(f"Running native uninstaller: {g['uninstall_cmd']}")
+        subprocess.run(g["uninstall_cmd"], shell=True, check=False)
+        return True
+    print(f"No native uninstaller available for {src}; falling back to file removal.",
+          file=sys.stderr)
+    return False
+
+
+def cmd_uninstall(argv: list[str]) -> None:
+    ap = argparse.ArgumentParser(
+        prog="gamestat uninstall",
+        description="Uninstall a game through its launcher (guarded, dry-run friendly).")
+    ap.add_argument("query", help="game name (substring) or Steam appid")
+    ap.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show the plan, delete nothing")
+    ap.add_argument("--via-launcher", action="store_true",
+                    help="hand off to the launcher's own uninstaller instead of deleting files")
+    ap.add_argument("--keep-compat", action="store_true",
+                    help="(Steam) keep the Proton prefix + shader cache")
+    ap.add_argument("--force", action="store_true",
+                    help="proceed even if the launcher appears to be running")
+    args = ap.parse_args(argv)
+
+    games, _ = collect(include_tools=True)
+    matches = resolve_games(games, args.query)
+    if not matches:
+        sys.exit(f"No installed game matches {args.query!r}.")
+    if len(matches) > 1:
+        print("Multiple matches — be more specific:", file=sys.stderr)
+        for g in matches:
+            tag = f"appid {g['appid']}" if g["appid"] else g["source"]
+            print(f"  [{g['source']}] {g['name']}  ({tag})", file=sys.stderr)
+        sys.exit(2)
+
+    g = matches[0]
+    if args.via_launcher:
+        if via_launcher(g):
+            return  # launcher owns it from here
+
+    plan = build_plan(g, keep_compat=args.keep_compat)
+    print(f"\nUninstall  {g['name']}  [{g['source']}]")
+    print(f"  reported size : {fmt_bytes(g['size'])}")
+    print(f"  reclaimable   : {fmt_bytes(plan['reclaim'])}")
+    print("  will remove:")
+    remove_paths(plan["paths"], dry_run=True)
+    for n in plan["notes"]:
+        print(f"  note: {n}")
+
+    if args.dry_run:
+        print("\n(dry run — nothing deleted)")
+        return
+
+    if not args.force and launcher_running(g["source"]):
+        sys.exit(f"\n{g['source']} appears to be running. Close it first, or pass --force.")
+
+    if not args.yes:
+        try:
+            ans = input(f"\nPermanently delete {g['name']}? [y/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    freed = remove_paths(plan["paths"], dry_run=False)
+    if g["source"] == "Lutris":
+        _lutris_mark_uninstalled(g["app_name"])
+    elif g["source"] in ("Epic", "GOG", "Amazon"):
+        _heroic_forget(g["source"], g["app_name"])
+    print(f"\nDone. Freed {fmt_bytes(freed)}.")
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +1171,13 @@ render();
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="WinDirStat for your game library — all launchers.")
+    argv = sys.argv[1:]
+    if argv and argv[0] == "uninstall":
+        return cmd_uninstall(argv[1:])
+
+    ap = argparse.ArgumentParser(
+        description="WinDirStat for your game library — all launchers.",
+        epilog="subcommands: uninstall <game>  — remove a game via its launcher")
     ap.add_argument("-o", "--output", default=str(Path.home() / ".cache/gamestat/report.html"))
     ap.add_argument("--all", action="store_true", help="include Proton/runtimes/redistributables")
     ap.add_argument("--only", default="", metavar="LAUNCHERS",
