@@ -9,3 +9,6 @@ __pycache__/
 
 # generated report
 report.html
+
+# rust build
+tui/target/

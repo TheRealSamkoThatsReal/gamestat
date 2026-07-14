@@ -617,8 +617,12 @@ def fmt_bytes(b: int) -> str:
 
 
 def resolve_games(games: list[dict], query: str) -> list[dict]:
-    """Match a game by Steam appid, then exact name, then substring."""
-    q = query.strip().lower()
+    """Match a game by exact uid, then Steam appid, then exact name, then substring."""
+    raw = query.strip()
+    uid_hit = [g for g in games if g["uid"] == raw]        # unambiguous (used by the TUI)
+    if uid_hit:
+        return uid_hit
+    q = raw.lower()
     if q.isdigit():
         hit = [g for g in games if str(g["appid"]) == q]
         if hit:

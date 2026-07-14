@@ -79,7 +79,14 @@ jobs:
           & $iscc "/DMyAppVersion=$ver" installer\gamestat.iss
           Copy-Item installer-out\gamestat-setup-x64.exe out\gamestat-setup-x64.exe
 
-      # ---- Linux: build the desktop tarball ----
+      # ---- Linux: build the ratatui TUI (Rust) ----
+      - name: Linux — build TUI (Rust/ratatui)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --manifest-path tui/Cargo.toml
+          cp tui/target/release/gamestat-tui out/gamestat-tui-linux-x86_64
+
+      # ---- Linux: build the desktop tarball (bundles the TUI too) ----
       - name: Linux — build tarball
         if: runner.os == 'Linux'
         run: bash packaging/linux/make-tarball.sh "${{ github.ref_name }}"

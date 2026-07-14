@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=gamestat (TUI)
+GenericName=Game Library Dashboard
+Comment=Terminal UI — rank games, disk usage, and uninstall
+Exec=gamestat-tui
+Icon=gamestat
+Terminal=true
+Categories=Game;Utility;ConsoleOnly;
+Keywords=steam;games;disk;uninstall;library;tui;

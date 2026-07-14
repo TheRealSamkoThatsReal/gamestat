@@ -12,9 +12,15 @@ mkdir -p "$stage"
 
 cp dist/gamestat                       "$stage/gamestat"
 cp packaging/linux/gamestat.desktop    "$stage/gamestat.desktop"
+cp packaging/linux/gamestat-tui.desktop "$stage/gamestat-tui.desktop"
 cp packaging/assets/icon.png           "$stage/icon.png"
 cp packaging/linux/install.sh          "$stage/install.sh"
 cp README.md                           "$stage/README.md" 2>/dev/null || true
+# Include the Rust TUI if it has been built.
+if [ -f tui/target/release/gamestat-tui ]; then
+  cp tui/target/release/gamestat-tui   "$stage/gamestat-tui"
+  chmod +x "$stage/gamestat-tui"
+fi
 chmod +x "$stage/gamestat" "$stage/install.sh"
 
 mkdir -p out

@@ -125,6 +125,25 @@ gamestat app --all    # include runtimes
   Without it, the Linux menu entry and `gamestat` open the same report in your
   browser — every feature except the in-window uninstall buttons.
 
+## Terminal UI (Linux)
+
+Prefer the terminal? `gamestat-tui` is a [ratatui](https://ratatui.rs) TUI — the
+same ranked list with source colors, ☁ cloud markers, and disk-usage bars, plus
+an uninstall confirmation right in the terminal. It's the fully-native Linux
+"app" experience (no webview needed).
+
+```
+gamestat-tui        # included in the Linux tarball; also a standalone download
+```
+
+Keys: `↑/↓` move · `p/s/r/n` sort (played/size/recent/name) · `/` search ·
+`t` tools · `u` uninstall (with cloud-save-aware confirm) · `g` refresh · `q` quit.
+
+It drives the same backend — it calls `gamestat --json` for data and
+`gamestat uninstall` for removal, so all the safety guards apply. Point it at a
+specific gamestat with `GAMESTAT_BIN=/path/to/gamestat`. Built from `tui/`
+(Rust); a ~700 KB static binary.
+
 ## Uninstalling games
 
 `gamestat uninstall "<game>"` removes a game through its launcher's real
