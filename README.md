@@ -98,9 +98,10 @@ gamestat uninstall "<game>" --yes             # skip the confirmation prompt
 
 What it does per launcher:
 
-- **Steam** — deletes the install folder, `appmanifest_<appid>.acf`, and (unless
-  `--keep-compat`) the Proton prefix + shader cache. Steam then correctly sees
-  the game as uninstalled.
+- **Steam** — deletes the install folder, `appmanifest_<appid>.acf`, and the
+  shader cache; Steam then correctly sees the game as uninstalled. The **Proton
+  prefix** (which can hold local-only saves) is handled by cloud-save detection
+  (below). Steam Cloud saves in `userdata/` are **never** touched.
 - **Lutris** — deletes the install folder and marks the entry uninstalled in
   Lutris (playtime is kept).
 - **Epic / GOG / Amazon (Heroic)** — deletes the folder and removes the entry
@@ -110,6 +111,12 @@ What it does per launcher:
 
 Safety:
 
+- **Cloud-save aware (Steam)** — gamestat detects whether a game has a Steam
+  Cloud save (a ☁ shows in the report). If it does, removing the Proton prefix
+  is safe (the save lives in `userdata/` + the cloud) and gamestat reclaims it.
+  If it **doesn't**, gamestat **keeps the Proton prefix by default** so it can't
+  wipe local-only saves — pass `--remove-prefix` to delete it anyway, or
+  `--keep-compat` to always keep it.
 - **Dry-run friendly** — always prints the exact paths and reclaimable size
   first; `--dry-run` deletes nothing.
 - **Confirmation prompt** before anything is deleted (skip with `--yes`).

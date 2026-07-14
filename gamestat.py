@@ -217,7 +217,7 @@ def _merge_playtime(text: str, out: dict[int, dict]) -> None:
 
 def rec(source: str, name: str, size, playtime_min=0, has_playtime=False,
         last_played=0, *, art="", appid=0, tool=False, install_dir="",
-        app_name="", uninstall_cmd="") -> dict:
+        app_name="", uninstall_cmd="", cloud=False) -> dict:
     """Normalized game record shared by every provider."""
     return {
         "source": source,
@@ -232,6 +232,7 @@ def rec(source: str, name: str, size, playtime_min=0, has_playtime=False,
         "install_dir": str(install_dir or ""),        # for uninstall
         "app_name": str(app_name or ""),              # launcher-internal id
         "uninstall_cmd": str(uninstall_cmd or ""),    # native uninstaller (Windows)
+        "cloud": bool(cloud),                         # Steam Cloud save present
     }
 
 
@@ -292,6 +293,7 @@ def scan_steam(include_tools: bool) -> list[dict]:
         return []
     games = scan_manifests(library_paths(root))
     playtimes = parse_playtime(root)
+    cloud_ids = steam_cloud_appids(root)
     rows = []
     for appid, g in games.items():
         is_tool = appid in TOOL_APPIDS or bool(TOOL_NAME_RE.match(g["name"]))
@@ -303,6 +305,7 @@ def scan_steam(include_tools: bool) -> list[dict]:
             pt.get("playtime", 0), True,
             max(g["last_played"], pt.get("last_played", 0)),
             appid=appid, tool=is_tool, install_dir=g["installdir"],
+            cloud=appid in cloud_ids,
         ))
     return rows
 
@@ -667,8 +670,53 @@ def safe_target(p: Path) -> bool:
     return p != Path.home() and p != Path(p.anchor) and len(p.parts) >= 3
 
 
-def steam_extra_paths(appid: int, keep_compat: bool) -> list[Path]:
-    """The appmanifest plus Proton prefix / shader cache / partial downloads."""
+def steam_cloud_appids(root: Path) -> set[int]:
+    """Appids that have a local Steam Cloud cache (userdata/<user>/<appid>/remote
+    with files, or a remotecache.vdf). Scans userdata once."""
+    ids: set[int] = set()
+    ud = root / "userdata"
+    if not ud.is_dir():
+        return ids
+    for user in ud.iterdir():
+        if not user.is_dir():
+            continue
+        for ap in user.iterdir():
+            if not ap.name.isdigit():
+                continue
+            remote = ap / "remote"
+            if (remote.is_dir() and any(remote.iterdir())) or (ap / "remotecache.vdf").exists():
+                ids.add(int(ap.name))
+    return ids
+
+
+def steam_cloud_info(appid: int) -> dict:
+    """Detailed local cloud-save info for one appid: has_cloud, files, bytes."""
+    info = {"has_cloud": False, "files": 0, "bytes": 0}
+    root = find_steam_root()
+    if not root:
+        return info
+    ud = root / "userdata"
+    if not ud.is_dir():
+        return info
+    for user in ud.iterdir():
+        remote = user / str(appid) / "remote"
+        if remote.is_dir():
+            for f in remote.rglob("*"):
+                if f.is_file():
+                    info["files"] += 1
+                    try:
+                        info["bytes"] += f.stat().st_size
+                    except OSError:
+                        pass
+        if (user / str(appid) / "remotecache.vdf").exists():
+            info["has_cloud"] = True
+    info["has_cloud"] = info["has_cloud"] or info["files"] > 0
+    return info
+
+
+def steam_extra_paths(appid: int, include_prefix: bool) -> list[Path]:
+    """The appmanifest + shader cache + partial downloads, and (only when
+    include_prefix) the Proton prefix. Never touches userdata (cloud saves)."""
     out: list[Path] = []
     root = find_steam_root()
     for lib in (library_paths(root) if root else []):
@@ -676,28 +724,51 @@ def steam_extra_paths(appid: int, keep_compat: bool) -> list[Path]:
         mf = apps / f"appmanifest_{appid}.acf"
         if mf.exists():
             out.append(mf)
-            if not keep_compat:
-                for sub in (f"compatdata/{appid}", f"shadercache/{appid}",
-                            f"downloading/{appid}"):
-                    d = apps / sub
-                    if d.exists():
-                        out.append(d)
+            for sub in (f"shadercache/{appid}", f"downloading/{appid}"):
+                d = apps / sub
+                if d.exists():
+                    out.append(d)
+            if include_prefix:
+                d = apps / f"compatdata/{appid}"
+                if d.exists():
+                    out.append(d)
             break
     return out
 
 
-def build_plan(g: dict, keep_compat: bool = False) -> dict:
-    """Compute the removal plan for a game record."""
+def build_plan(g: dict, keep_compat: bool = False, remove_prefix: bool = False) -> dict:
+    """Compute the removal plan for a game record.
+
+    For Steam, the Proton prefix (compatdata) may hold local-only saves, so it's
+    removed only when a Steam Cloud save exists (save is safe) or the user passes
+    --remove-prefix. --keep-compat always keeps it.
+    """
     src = g["source"]
     inst = Path(g["install_dir"]) if g["install_dir"] else None
     paths: list[Path] = []
     notes: list[str] = []
     method = "files"
+    cloud = {"has_cloud": False, "files": 0, "bytes": 0}
     if inst:
         paths.append(inst)
     if src == "Steam":
         method = "steam"
-        paths += steam_extra_paths(g["appid"], keep_compat)
+        cloud = steam_cloud_info(g["appid"])
+        include_prefix = (not keep_compat) and (cloud["has_cloud"] or remove_prefix)
+        paths += steam_extra_paths(g["appid"], include_prefix)
+        prefix_exists = bool(_steam_compat_dirs(g["appid"]))
+        if cloud["has_cloud"]:
+            notes.append(f"☁ Steam Cloud save found ({cloud['files']} file(s), "
+                         f"{fmt_bytes(cloud['bytes'])}) — preserved in userdata & cloud.")
+        if prefix_exists:
+            if keep_compat:
+                notes.append("Keeping the Proton prefix (--keep-compat).")
+            elif not include_prefix:            # no cloud, no --remove-prefix
+                notes.append("No cloud save detected — KEEPING the Proton prefix "
+                             "(may hold local saves). Add --remove-prefix to delete it too.")
+            elif not cloud["has_cloud"]:        # include_prefix via --remove-prefix
+                notes.append("Removing the Proton prefix (--remove-prefix) — any "
+                             "local-only saves inside will be lost.")
     elif src == "Lutris":
         method = "lutris"
         notes.append("Marks the Lutris entry uninstalled (playtime kept).")
@@ -708,7 +779,18 @@ def build_plan(g: dict, keep_compat: bool = False) -> dict:
         notes.append("A native uninstaller exists — use --via-launcher to run it.")
     reclaim = sum((dir_size(p) if p.is_dir() else p.stat().st_size)
                   for p in paths if p.exists())
-    return {"method": method, "paths": paths, "notes": notes, "reclaim": reclaim}
+    return {"method": method, "paths": paths, "notes": notes,
+            "reclaim": reclaim, "cloud": cloud}
+
+
+def _steam_compat_dirs(appid: int) -> list[Path]:
+    root = find_steam_root()
+    out = []
+    for lib in (library_paths(root) if root else []):
+        d = lib / "steamapps" / "compatdata" / str(appid)
+        if d.exists():
+            out.append(d)
+    return out
 
 
 def remove_paths(paths: list[Path], dry_run: bool) -> int:
@@ -802,7 +884,10 @@ def cmd_uninstall(argv: list[str]) -> None:
     ap.add_argument("--via-launcher", action="store_true",
                     help="hand off to the launcher's own uninstaller instead of deleting files")
     ap.add_argument("--keep-compat", action="store_true",
-                    help="(Steam) keep the Proton prefix + shader cache")
+                    help="(Steam) always keep the Proton prefix")
+    ap.add_argument("--remove-prefix", action="store_true",
+                    help="(Steam) delete the Proton prefix even without a cloud save "
+                         "(loses local-only saves)")
     ap.add_argument("--force", action="store_true",
                     help="proceed even if the launcher appears to be running")
     args = ap.parse_args(argv)
@@ -823,10 +908,15 @@ def cmd_uninstall(argv: list[str]) -> None:
         if via_launcher(g):
             return  # launcher owns it from here
 
-    plan = build_plan(g, keep_compat=args.keep_compat)
+    plan = build_plan(g, keep_compat=args.keep_compat, remove_prefix=args.remove_prefix)
+    cloud = plan["cloud"]
+    cloud_txt = (f"yes ({cloud['files']} file(s), {fmt_bytes(cloud['bytes'])}) — safe"
+                 if cloud["has_cloud"] else "none detected")
     print(f"\nUninstall  {g['name']}  [{g['source']}]")
     print(f"  reported size : {fmt_bytes(g['size'])}")
     print(f"  reclaimable   : {fmt_bytes(plan['reclaim'])}")
+    if g["source"] == "Steam":
+        print(f"  cloud save    : {cloud_txt}")
     print("  will remove:")
     remove_paths(plan["paths"], dry_run=True)
     for n in plan["notes"]:
@@ -937,6 +1027,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border-radius:20px;padding:1px 7px;margin-left:6px;vertical-align:middle}
   .badge{display:inline-block;font-size:10px;font-weight:700;padding:1px 8px;border-radius:20px;
     margin-left:8px;vertical-align:middle;border:1px solid}
+  .cloud{margin-left:6px;color:#66c0f4;font-size:12px;vertical-align:middle;cursor:help;
+    text-shadow:0 0 8px rgba(102,192,244,.6)}
   .chips{display:flex;gap:6px;flex-wrap:wrap}
   .chip{background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:20px;
     padding:5px 11px;font:inherit;font-size:11px;cursor:pointer;transition:all .12s}
@@ -1072,7 +1164,7 @@ function renderList(){
     return `<div class="row ${i<3?'top':''}" style="--fill:${fill}%">
       <div class="rank">${i+1}</div>
       ${capHtml(x)}
-      <div class="nm">${esc(x.name)}${badge(x.source)}${x.tool?'<span class="pill">tool</span>':''}
+      <div class="nm">${esc(x.name)}${badge(x.source)}${x.cloud?'<span class="cloud" title="Steam Cloud save — safe to uninstall">☁</span>':''}${x.tool?'<span class="pill">tool</span>':''}
         <small>${x.appid?'appid '+x.appid:'installed game'}</small></div>
       <div class="col pt">${pt}</div>
       <div class="col">${fmtSize(x.size)}</div>
