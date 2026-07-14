@@ -1,0 +1,9 @@
+# PyInstaller / build
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# generated report
+report.html
