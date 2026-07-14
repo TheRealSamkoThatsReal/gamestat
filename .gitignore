@@ -1,6 +1,8 @@
 # PyInstaller / build
 build/
 dist/
+out/
+installer-out/
 *.spec
 __pycache__/
 *.pyc

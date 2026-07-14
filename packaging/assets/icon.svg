@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#122236"/><stop offset="1" stop-color="#0a0e14"/>
+    </linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="112" fill="none" stroke="#1c2b40" stroke-width="4"/>
+  <!-- treemap blocks, sized+colored like the app -->
+  <g filter="url(#glow)">
+    <rect x="72"  y="96"  width="188" height="188" rx="14" fill="#00f0ff"/>
+    <rect x="272" y="96"  width="168" height="120" rx="14" fill="#0aa6c8"/>
+    <rect x="272" y="228" width="168" height="56"  rx="14" fill="#12324a"/>
+    <rect x="72"  y="296" width="120" height="120" rx="14" fill="#ff3bd4"/>
+    <rect x="204" y="296" width="112" height="120" rx="14" fill="#7a2f9e"/>
+    <rect x="328" y="296" width="112" height="120" rx="14" fill="#123a52"/>
+  </g>
+</svg>

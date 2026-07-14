@@ -47,18 +47,26 @@ format that doesn't parse, is simply skipped — it never crashes the report).
 
 ## Install
 
-### Prebuilt binary (no Python needed)
+### Prebuilt downloads (no Python needed)
 
-Grab the latest standalone binary for your OS from the
-[**Releases**](../../releases) page:
+Grab the latest for your OS from the [**Releases**](../../releases) page. These
+builds include the desktop app (`gamestat app`) — no `pip install` required.
 
-| OS | Asset |
-|----|-------|
-| Linux | `gamestat-linux-x86_64` |
-| Windows | `gamestat-windows-x86_64.exe` |
-| macOS (Apple Silicon) | `gamestat-macos-arm64` |
+| OS | Recommended | Also available |
+|----|-------------|----------------|
+| **Windows** | `gamestat-setup-x64.exe` (installer — Start-Menu entry, optional PATH) | `gamestat-windows-x86_64.exe` (portable) |
+| **Linux** | `gamestat-linux-x86_64.tar.gz` (binary + `install.sh` + menu entry) | `gamestat-linux-x86_64` (portable binary) |
+| **macOS** (Apple Silicon) | `gamestat-macos-arm64` | — |
 
-On Linux/macOS, make it executable: `chmod +x gamestat-*` then run it.
+- **Windows installer** — double-click; installs per-user (no admin prompt),
+  adds a Start-Menu shortcut, and optionally puts `gamestat` on your PATH.
+- **Linux tarball** — extract and run `./install.sh` to add it to `~/.local/bin`
+  with an app-menu entry, or just run the portable binary directly.
+- **macOS / portable binaries** — `chmod +x gamestat-*` then run.
+
+> The Linux desktop app uses your system's WebKitGTK (`webkit2gtk-4.1`), which
+> ships with essentially every modern desktop. Windows uses the built-in
+> WebView2 runtime (present on Windows 10/11).
 
 ### From source
 

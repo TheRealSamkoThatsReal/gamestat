@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=gamestat
+GenericName=Game Library Dashboard
+Comment=Rank games by playtime, see a disk-usage treemap, and uninstall
+Exec=gamestat app
+Icon=gamestat
+Terminal=false
+Categories=Game;Utility;
+Keywords=steam;games;disk;uninstall;library;
