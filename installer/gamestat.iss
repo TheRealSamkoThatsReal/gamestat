@@ -22,6 +22,8 @@ DefaultDirName={localappdata}\Programs\gamestat
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#MyAppExe}
 UninstallDisplayName={#MyAppName}
+; Paths below are resolved relative to the repo root, not this installer/ dir.
+SourceDir=..
 OutputDir=installer-out
 OutputBaseFilename=gamestat-setup-x64
 SetupIconFile=packaging\assets\icon.ico
