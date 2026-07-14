@@ -1,26 +1,34 @@
 #!/usr/bin/env python3
 """gamestat — a WinDirStat for your game library.
 
-Scans installed Steam games and builds a neon-noir web report that ranks them
-from most-played to least-played and draws a disk-usage treemap (the WinDirStat
-homage). Zero dependencies — pure stdlib. Cross-platform: Linux, Windows, macOS.
-Cover art is pulled from Steam's CDN by appid at view time, so no fragile
-local-cache mapping.
+Scans installed games across every launcher it can find — Steam, Epic, GOG,
+Amazon, EA, Ubisoft, Battle.net, Riot, plus Heroic / Lutris on Linux — and
+builds a neon-noir web report that ranks them by playtime and draws a
+disk-usage treemap (the WinDirStat homage). Zero dependencies — pure stdlib.
+Cross-platform: Linux, Windows, macOS.
+
+Disk usage is measured for every launcher (by reading the launcher's manifest
+or, failing that, walking the install folder). Playtime is only shown for
+launchers that record it locally (Steam and Lutris); others rank by size /
+recency and show "—" for playtime.
 
 Usage:
     gamestat                # scan, write report, open in browser
     gamestat --no-open      # just write the report, print its path
     gamestat --all          # include Proton / runtimes / redistributables
+    gamestat --only steam,epic   # limit to specific launchers
     gamestat -o FILE.html   # choose the output path
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -201,38 +209,379 @@ def _merge_playtime(text: str, out: dict[int, dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Assemble
+# Shared helpers
 # ---------------------------------------------------------------------------
 
-def collect(include_tools: bool) -> tuple[list[dict], dict]:
+def rec(source: str, name: str, size, playtime_min=0, has_playtime=False,
+        last_played=0, *, art="", appid=0, tool=False) -> dict:
+    """Normalized game record shared by every provider."""
+    return {
+        "source": source,
+        "name": name.strip() or "Unknown",
+        "size": int(size or 0),
+        "playtime": int(playtime_min or 0),          # minutes
+        "has_playtime": bool(has_playtime),
+        "last_played": int(last_played or 0),         # unix seconds
+        "art": art or "",                             # explicit cover URL
+        "appid": int(appid or 0),                     # Steam appid → CDN art
+        "tool": bool(tool),
+    }
+
+
+def dir_size(path: Path) -> int:
+    """Total bytes of a directory tree (metadata only, errors ignored)."""
+    total = 0
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if e.is_symlink():
+                        continue
+                    if e.is_file():
+                        total += e.stat().st_size
+                    elif e.is_dir():
+                        total += dir_size(Path(e.path))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+_SIZE_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def parse_size(s) -> int:
+    """'71.21 GiB' / '512 MB' → bytes. Ints pass through."""
+    if isinstance(s, (int, float)):
+        return int(s)
+    m = re.match(r"([\d.]+)\s*([KMGT]?)i?B", str(s).strip(), re.I)
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2).upper()]) if m else 0
+
+
+def iso_unix(s) -> int:
+    if not s:
+        return 0
+    try:
+        return int(datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def _load_json(path: Path):
+    try:
+        return json.loads(path.read_text(errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Providers — each returns list[rec]. Any provider may raise; collect() guards.
+# ---------------------------------------------------------------------------
+
+def scan_steam(include_tools: bool) -> list[dict]:
     root = find_steam_root()
     if not root:
-        sys.exit("No Steam installation found (looked in ~/.steam, ~/.local/share/Steam).")
+        return []
     games = scan_manifests(library_paths(root))
     playtimes = parse_playtime(root)
-
     rows = []
     for appid, g in games.items():
         is_tool = appid in TOOL_APPIDS or bool(TOOL_NAME_RE.match(g["name"]))
         if is_tool and not include_tools:
             continue
         pt = playtimes.get(appid, {})
-        rows.append({
-            **g,
-            "playtime": pt.get("playtime", 0),          # minutes
-            "last_played": max(g["last_played"], pt.get("last_played", 0)),
-            "tool": is_tool,
-        })
+        rows.append(rec(
+            "Steam", g["name"], g["size"],
+            pt.get("playtime", 0), True,
+            max(g["last_played"], pt.get("last_played", 0)),
+            appid=appid, tool=is_tool,
+        ))
+    return rows
 
-    rows.sort(key=lambda r: (r["playtime"], r["size"]), reverse=True)
+
+def scan_lutris() -> list[dict]:
+    import sqlite3
+    dbs = [
+        Path.home() / ".local/share/lutris/pga.db",
+        Path.home() / ".var/app/net.lutris.Lutris/data/lutris/pga.db",
+    ]
+    coverdirs = [
+        Path.home() / ".local/share/lutris/coverart",
+        Path.home() / ".cache/lutris/coverart",
+        Path.home() / ".var/app/net.lutris.Lutris/data/lutris/coverart",
+    ]
+    rows = []
+    for db in dbs:
+        if not db.exists():
+            continue
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            q = ("SELECT name, directory, playtime, lastplayed, installed, "
+                 "slug, runner FROM games")
+            for name, directory, playtime, lastplayed, installed, slug, runner in con.execute(q):
+                if not installed:
+                    continue
+                if runner == "steam":          # avoid double-counting Steam
+                    continue
+                d = Path(directory) if directory else None
+                size = dir_size(d) if d and d.is_dir() else 0
+                art = ""
+                for cd in coverdirs:
+                    p = cd / f"{slug}.jpg"
+                    if p.exists():
+                        art = p.resolve().as_uri()
+                        break
+                rows.append(rec(
+                    "Lutris", name or slug or "Unknown", size,
+                    int(round((playtime or 0) * 60)), True, lastplayed or 0, art=art,
+                ))
+        finally:
+            con.close()
+    return rows
+
+
+def _heroic_base() -> Path | None:
+    for b in (Path.home() / ".config/heroic",
+              Path.home() / ".var/app/com.heroicgameslauncher.hgl/config/heroic"):
+        if b.is_dir():
+            return b
+    return None
+
+
+def scan_heroic() -> list[dict]:
+    base = _heroic_base()
+    if not base:
+        return []
+    ts = _load_json(base / "store/timestamp.json") or {}
+    rows = []
+    runners = [("legendary", "Epic"), ("gog", "GOG"), ("nile", "Amazon")]
+    for runner, label in runners:
+        lib = _load_json(base / f"store_cache/{runner}_library.json")
+        if isinstance(lib, dict):
+            lib = lib.get("library", list(lib.values()))
+        if not isinstance(lib, list):
+            continue
+        exact = _legendary_sizes(base) if runner == "legendary" else {}
+        for g in lib:
+            if not isinstance(g, dict) or not g.get("is_installed"):
+                continue
+            app = g.get("app_name", "")
+            inst = g.get("install", {}) or {}
+            size = exact.get(app) or parse_size(inst.get("install_size", 0))
+            if not size and inst.get("install_path"):
+                size = dir_size(Path(inst["install_path"]))
+            art = g.get("art_square") or g.get("art_cover") or ""
+            last = iso_unix((ts.get(app) or {}).get("firstPlayed"))
+            rows.append(rec(label, g.get("title", app), size, 0, False, last, art=art))
+    return rows
+
+
+def _legendary_sizes(base: Path) -> dict:
+    d = _load_json(base / "legendaryConfig/legendary/installed.json") or {}
+    return {k: int(v.get("install_size", 0)) for k, v in d.items()
+            if isinstance(v, dict)}
+
+
+# ---- Windows-native launchers (registry / config driven) ------------------
+
+def _winreg_subkeys(hive, path):
+    """Yield (subkey_name, opened_key) for every subkey. Windows only."""
+    import winreg
+    try:
+        root = winreg.OpenKey(hive, path)
+    except OSError:
+        return
+    try:
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                yield name, winreg.OpenKey(root, name)
+            except OSError:
+                pass
+    finally:
+        winreg.CloseKey(root)
+
+
+def _winreg_val(key, name):
+    import winreg
+    try:
+        return winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return None
+
+
+def scan_epic_windows() -> list[dict]:
+    md = Path(r"C:/ProgramData/Epic/EpicGamesLauncher/Data/Manifests")
+    if not md.is_dir():
+        return []
+    rows = []
+    for item in md.glob("*.item"):
+        d = _load_json(item)
+        if not isinstance(d, dict) or d.get("bIsIncompleteInstall"):
+            continue
+        loc = d.get("InstallLocation", "")
+        size = int(d.get("InstallSize", 0)) or (dir_size(Path(loc)) if loc else 0)
+        rows.append(rec("Epic", d.get("DisplayName", d.get("AppName", "?")),
+                        size, 0, False, 0))
+    return rows
+
+
+def scan_gog_windows() -> list[dict]:
+    import winreg
+    rows = []
+    for _id, key in _winreg_subkeys(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\WOW6432Node\GOG.com\Games"):
+        try:
+            name = _winreg_val(key, "gameName") or "?"
+            path = _winreg_val(key, "path")
+            size = dir_size(Path(path)) if path else 0
+            rows.append(rec("GOG", name, size, 0, False, 0))
+        finally:
+            winreg.CloseKey(key)
+    return rows
+
+
+def scan_ubisoft_windows() -> list[dict]:
+    import winreg
+    rows = []
+    for _id, key in _winreg_subkeys(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs"):
+        try:
+            path = _winreg_val(key, "InstallDir")
+            if not path:
+                continue
+            p = Path(path)
+            rows.append(rec("Ubisoft", p.name or "Ubisoft game",
+                            dir_size(p), 0, False, 0))
+        finally:
+            winreg.CloseKey(key)
+    return rows
+
+
+def _scan_uninstall_by_publisher(labels: dict) -> list[dict]:
+    """Walk the Windows Uninstall registry and pick entries whose Publisher
+    matches a known launcher. labels maps a lowercase publisher-substring →
+    display source name."""
+    import winreg
+    rows = []
+    roots = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    for hive, path in roots:
+        for _id, key in _winreg_subkeys(hive, path):
+            try:
+                pub = (_winreg_val(key, "Publisher") or "").lower()
+                source = next((lbl for sub, lbl in labels.items() if sub in pub), None)
+                if not source:
+                    continue
+                name = _winreg_val(key, "DisplayName")
+                loc = _winreg_val(key, "InstallLocation")
+                if not name or not loc or not Path(loc).is_dir():
+                    continue
+                rows.append(rec(source, name, dir_size(Path(loc)), 0, False, 0))
+            finally:
+                winreg.CloseKey(key)
+    return rows
+
+
+def scan_battlenet_windows() -> list[dict]:
+    return _scan_uninstall_by_publisher({"blizzard": "Battle.net"})
+
+
+def scan_ea_windows() -> list[dict]:
+    return _scan_uninstall_by_publisher({"electronic arts": "EA"})
+
+
+def scan_riot_windows() -> list[dict]:
+    cfg = _load_json(Path(r"C:/ProgramData/Riot Games/RiotClientInstalls.json"))
+    if not isinstance(cfg, dict):
+        return []
+    seen, rows = set(), []
+    for key in ("associated_client", "patchlines"):
+        for raw in (cfg.get(key) or {}):
+            p = Path(raw)
+            # associated_client maps game dir → client path; the key is the dir
+            game_dir = p if p.is_dir() else p.parent
+            if not game_dir.is_dir() or str(game_dir) in seen:
+                continue
+            seen.add(str(game_dir))
+            rows.append(rec("Riot", game_dir.name, dir_size(game_dir), 0, False, 0))
+    return rows
+
+
+# Registry of provider callables. Windows-only ones no-op elsewhere because
+# `import winreg` raises ImportError (caught in collect()).
+PROVIDERS = {
+    "steam": None,   # handled specially (needs include_tools)
+    "lutris": scan_lutris,
+    "heroic": scan_heroic,
+    "epic": scan_epic_windows,
+    "gog": scan_gog_windows,
+    "ubisoft": scan_ubisoft_windows,
+    "battlenet": scan_battlenet_windows,
+    "ea": scan_ea_windows,
+    "riot": scan_riot_windows,
+}
+
+
+# ---------------------------------------------------------------------------
+# Assemble
+# ---------------------------------------------------------------------------
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def collect(include_tools: bool, only: set[str] | None = None) -> tuple[list[dict], dict]:
+    rows: list[dict] = []
+    errors: list[str] = []
+
+    def run(key, fn):
+        if only and key not in only:
+            return
+        try:
+            rows.extend(fn())
+        except ImportError:
+            pass  # e.g. winreg off-Windows
+        except Exception as e:  # noqa: BLE001 — one bad launcher shouldn't kill the report
+            errors.append(f"{key}: {e}")
+
+    run("steam", lambda: scan_steam(include_tools))
+    for key, fn in PROVIDERS.items():
+        if fn is not None:
+            run(key, fn)
+
+    # Dedupe games that show up under more than one launcher (e.g. a Steam
+    # title also imported into Lutris). Keep the record with the richest data.
+    best: dict[str, dict] = {}
+    for r in rows:
+        k = _norm_name(r["name"])
+        cur = best.get(k)
+        score = (r["has_playtime"], r["playtime"], r["size"])
+        if not cur or score > (cur["has_playtime"], cur["playtime"], cur["size"]):
+            best[k] = r
+    deduped = list(best.values())
+
+    deduped.sort(key=lambda r: (r["has_playtime"], r["playtime"], r["size"]),
+                 reverse=True)
+
+    sources = sorted({r["source"] for r in deduped})
     meta = {
-        "steam_root": str(root),
         "generated": int(time.time()),
-        "total_size": sum(r["size"] for r in rows),
-        "total_playtime": sum(r["playtime"] for r in rows),
-        "count": len(rows),
+        "total_size": sum(r["size"] for r in deduped),
+        "total_playtime": sum(r["playtime"] for r in deduped if r["has_playtime"]),
+        "count": len(deduped),
+        "sources": sources,
+        "errors": errors,
     }
-    return rows, meta
+    return deduped, meta
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +650,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .row>*{position:relative}
   .rank{font-weight:800;color:var(--dim);text-align:center}
   .row.top .rank{color:var(--cyan)}
-  .cap{width:90px;height:42px;border-radius:6px;background:#0b1420 center/cover no-repeat;
+  .cap{position:relative;width:90px;height:42px;border-radius:6px;overflow:hidden;
     box-shadow:inset 0 0 0 1px var(--line)}
+  .cap .ini{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-weight:800;font-size:15px;color:rgba(255,255,255,.85);letter-spacing:1px}
+  .cap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
   .nm{font-weight:600;color:#eaf6ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .nm small{display:block;color:var(--dim);font-size:11px;font-weight:400}
   .pt{font-weight:700}
@@ -311,6 +663,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .muted{color:var(--dim)}
   .pill{display:inline-block;font-size:10px;color:var(--mag);border:1px solid rgba(255,59,212,.4);
     border-radius:20px;padding:1px 7px;margin-left:6px;vertical-align:middle}
+  .badge{display:inline-block;font-size:10px;font-weight:700;padding:1px 8px;border-radius:20px;
+    margin-left:8px;vertical-align:middle;border:1px solid}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:20px;
+    padding:5px 11px;font:inherit;font-size:11px;cursor:pointer;transition:all .12s}
+  .chip.on{color:var(--c);border-color:color-mix(in srgb,var(--c) 55%,transparent);
+    background:color-mix(in srgb,var(--c) 13%,transparent);box-shadow:0 0 12px -5px var(--c)}
 
   /* ---- treemap ---- */
   #treemap{position:relative;width:100%;height:74vh;border:1px solid var(--line);border-radius:14px;
@@ -323,6 +682,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tile .tn{font-size:12px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000;line-height:1.2;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .tile .ts{font-size:11px;color:#bfe9ff;text-shadow:0 1px 2px #000;margin-top:2px}
+  .tile .tbadge{position:absolute;top:6px;left:8px;font-size:10px;font-weight:800;
+    letter-spacing:.3px;text-shadow:0 1px 3px #000}
   .legend{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:11px;margin:12px 2px 0}
   .grad{height:9px;width:180px;border-radius:5px;background:linear-gradient(90deg,var(--heat0),var(--cyan) 55%,var(--mag))}
   .hide{display:none!important}
@@ -338,6 +699,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="stats">
     <div class="stat"><div class="n" id="s-count">·</div><div class="l">Games</div></div>
+    <div class="stat"><div class="n" id="s-launch">·</div><div class="l">Launchers</div></div>
     <div class="stat"><div class="n" id="s-size">·</div><div class="l">On Disk</div></div>
     <div class="stat"><div class="n" id="s-time">·</div><div class="l">Played</div></div>
   </div>
@@ -357,6 +719,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <input type="search" id="q" placeholder="filter games…" autocomplete="off">
   <label class="chk"><input type="checkbox" id="tools"> show tools/runtimes</label>
 </div>
+<div class="bar" id="srcbar">
+  <span class="l" style="color:var(--dim);font-size:11px;letter-spacing:1px">LAUNCHERS</span>
+  <div class="chips" id="sources"></div>
+</div>
 
 <main>
   <div id="list"></div>
@@ -370,52 +736,73 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <script>
 const DATA = /*__DATA__*/;
 const $ = s => document.querySelector(s);
-const state = {view:"list", sort:"playtime", q:"", tools:false};
+const state = {view:"list", sort:"playtime", q:"", tools:false, sources:new Set(DATA.meta.sources)};
+
+const SRC = {Steam:'#66c0f4', Epic:'#d580ff', GOG:'#a259ff', Amazon:'#ff9900',
+  Lutris:'#ff6b1a', 'Battle.net':'#00a8ff', Riot:'#ff4655', EA:'#ff5c5c', Ubisoft:'#3a9bff'};
+const srcColor = s => SRC[s] || '#7aa2c8';
 
 const fmtSize = b => { const u=["B","KB","MB","GB","TB"]; let i=0; while(b>=1024&&i<4){b/=1024;i++;} return b.toFixed(b<10&&i>0?1:0)+" "+u[i]; };
 const fmtTime = m => { if(!m) return "—"; const h=m/60; if(h<1) return m+"m"; if(h<100) return h.toFixed(1)+"h"; return Math.round(h)+"h"; };
 const fmtDate = t => { if(!t) return "never"; const d=(Date.now()/1000-t)/86400; if(d<1) return "today"; if(d<2) return "yesterday"; if(d<30) return Math.round(d)+"d ago"; if(d<365) return Math.round(d/30)+"mo ago"; return Math.round(d/365)+"y ago"; };
-const cap = id => `https://cdn.cloudflare.steamstatic.com/steam/apps/${id}/header.jpg`;
+const steamCdn = id => `https://cdn.cloudflare.steamstatic.com/steam/apps/${id}/header.jpg`;
+const artUrl = g => g.art ? g.art : (g.appid ? steamCdn(g.appid) : "");
+const initials = n => (n.replace(/[^A-Za-z0-9 ]/g,'').split(/\s+/).filter(Boolean).slice(0,2).map(w=>w[0]).join('')||'?').toUpperCase();
+const capHtml = g => {
+  const url=artUrl(g), c=srcColor(g.source);
+  const img = url ? `<img src="${url}" onerror="this.remove()">` : '';
+  return `<div class="cap" style="background:linear-gradient(135deg,${c}33,#0b1420)"><span class="ini">${esc(initials(g.name))}</span>${img}</div>`;
+};
+const badge = s => `<span class="badge" style="color:${srcColor(s)};border-color:${srcColor(s)}66;background:${srcColor(s)}18">${esc(s)}</span>`;
 const heat = f => { // 0..1 -> heat0 -> cyan -> mag
   const mix=(a,b,t)=>a.map((v,i)=>Math.round(v+(b[i]-v)*t));
   const c0=[18,50,74],c1=[0,240,255],c2=[255,59,212];
   const rgb = f<.5?mix(c0,c1,f/.5):mix(c1,c2,(f-.5)/.5);
   return `rgb(${rgb.join(",")})`;
 };
+// metric used for the current sort (playtime treats "unknown" as -1 so it sinks)
+const metricOf = x => state.sort==="name" ? (x.has_playtime?x.playtime:0)
+  : state.sort==="playtime" ? (x.has_playtime?x.playtime:-1) : (x[state.sort]||0);
 
 function visible(){
   let g = DATA.games.slice();
   if(!state.tools) g = g.filter(x=>!x.tool);
+  g = g.filter(x=>state.sources.has(x.source));
   if(state.q){ const q=state.q.toLowerCase(); g = g.filter(x=>x.name.toLowerCase().includes(q)); }
   const s = state.sort;
-  g.sort((a,b)=> s==="name" ? a.name.localeCompare(b.name) : (b[s]-a[s]) || (b.playtime-a.playtime));
+  if(s==="name") g.sort((a,b)=>a.name.localeCompare(b.name));
+  else if(s==="playtime") g.sort((a,b)=> (b.has_playtime-a.has_playtime) || (b.playtime-a.playtime) || (b.size-a.size));
+  else g.sort((a,b)=> (b[s]-a[s]) || (b.has_playtime-a.has_playtime) || (b.playtime-a.playtime));
   return g;
 }
 
 function renderStats(){
   const g = state.tools?DATA.games:DATA.games.filter(x=>!x.tool);
   $("#s-count").textContent = g.length;
+  $("#s-launch").textContent = DATA.meta.sources.length;
   $("#s-size").textContent = fmtSize(g.reduce((s,x)=>s+x.size,0));
-  $("#s-time").textContent = fmtTime(g.reduce((s,x)=>s+x.playtime,0));
+  $("#s-time").textContent = fmtTime(g.filter(x=>x.has_playtime).reduce((s,x)=>s+x.playtime,0));
   const d=new Date(DATA.meta.generated*1000);
-  $("#sub").textContent = DATA.meta.steam_root;
-  $("#foot").textContent = `scanned ${DATA.meta.steam_root} · generated ${d.toLocaleString()} · cover art © valve/steam`;
+  $("#sub").textContent = DATA.meta.sources.join('  ·  ') || 'no launchers found';
+  $("#foot").textContent = `generated ${d.toLocaleString()} · playtime shown where the launcher records it (Steam, Lutris) · cover art © respective stores`;
 }
 
 function renderList(){
   const g = visible();
-  const max = Math.max(1, ...g.map(x=>x[state.sort==="name"?"playtime":state.sort]||0));
+  const max = Math.max(1, ...g.map(x=>Math.max(0,metricOf(x))));
   const el = $("#list");
   if(!g.length){ el.innerHTML='<div class="empty">no games match.</div>'; return; }
   el.innerHTML = g.map((x,i)=>{
-    const metric = x[state.sort==="name"?"playtime":state.sort]||0;
-    const fill = Math.round(100*metric/max);
+    const fill = Math.round(100*Math.max(0,metricOf(x))/max);
+    const pt = x.has_playtime
+      ? `${fmtTime(x.playtime)} <span class="u">played</span>`
+      : `<span class="muted">—</span>`;
     return `<div class="row ${i<3?'top':''}" style="--fill:${fill}%">
       <div class="rank">${i+1}</div>
-      <div class="cap" style="background-image:url('${cap(x.appid)}')"></div>
-      <div class="nm">${esc(x.name)}${x.tool?'<span class="pill">tool</span>':''}
-        <small>appid ${x.appid}</small></div>
-      <div class="col pt">${fmtTime(x.playtime)} <span class="u">played</span></div>
+      ${capHtml(x)}
+      <div class="nm">${esc(x.name)}${badge(x.source)}${x.tool?'<span class="pill">tool</span>':''}
+        <small>${x.appid?'appid '+x.appid:'installed game'}</small></div>
+      <div class="col pt">${pt}</div>
       <div class="col">${fmtSize(x.size)}</div>
       <div class="col muted">${fmtDate(x.last_played)}</div>
     </div>`;
@@ -458,12 +845,16 @@ function renderTree(){
   const maxPt=Math.max(1,...g.map(x=>x.playtime));
   const tiles=squarify(items,0,0,W,H);
   box.innerHTML=tiles.map(t=>{
-    const x=t.g; const f=Math.sqrt(x.playtime/maxPt);
+    const x=t.g; const f=x.has_playtime?Math.sqrt(x.playtime/maxPt):0;
     const big = t.w>78 && t.h>46;
-    return `<div class="tile" title="${esc(x.name)} — ${fmtTime(x.playtime)} played, ${fmtSize(x.size)}"
+    const url = artUrl(x), c = srcColor(x.source);
+    const ptTxt = x.has_playtime?fmtTime(x.playtime):'playtime n/a';
+    return `<div class="tile" title="${esc(x.name)} · ${esc(x.source)} — ${fmtSize(x.size)}, ${ptTxt}"
       style="left:${t.x}px;top:${t.y}px;width:${t.w}px;height:${t.h}px;
-      background-color:${heat(f)};background-image:${big?`url('${cap(x.appid)}')`:'none'}">
-      <div class="t">${big?`<div class="tn">${esc(x.name)}</div><div class="ts">${fmtSize(x.size)} · ${fmtTime(x.playtime)}</div>`:''}</div>
+      background-color:${heat(f)};box-shadow:inset 0 3px 0 ${c};
+      background-image:${big&&url?`url('${url}')`:'none'}">
+      <div class="t">${big?`<div class="tn">${esc(x.name)}</div><div class="ts">${fmtSize(x.size)} · ${ptTxt}</div>`:''}</div>
+      ${big?`<span class="tbadge" style="color:${c}">${esc(x.source)}</span>`:''}
     </div>`;
   }).join("");
 }
@@ -477,6 +868,18 @@ function render(){
   if(state.view==="tree") renderTree(); else renderList();
 }
 
+function buildSources(){
+  const el=$("#sources");
+  el.innerHTML = DATA.meta.sources.map(s=>
+    `<button class="chip on" data-src="${esc(s)}" style="--c:${srcColor(s)}">${esc(s)}</button>`).join("");
+  el.onclick=e=>{ const b=e.target.closest("button"); if(!b) return;
+    b.classList.toggle("on");
+    state.sources = new Set([...el.querySelectorAll("button.on")].map(x=>x.dataset.src));
+    render();
+  };
+  if(DATA.meta.sources.length<2) $("#srcbar").style.display="none";
+}
+
 $("#view").onclick=e=>{const b=e.target.closest("button"); if(!b)return;
   state.view=b.dataset.v; [...e.currentTarget.children].forEach(c=>c.classList.toggle("on",c===b)); render();};
 $("#sort").onclick=e=>{const b=e.target.closest("button"); if(!b)return;
@@ -484,6 +887,7 @@ $("#sort").onclick=e=>{const b=e.target.closest("button"); if(!b)return;
 $("#q").oninput=e=>{state.q=e.target.value.trim(); render();};
 $("#tools").onchange=e=>{state.tools=e.target.checked; render();};
 addEventListener("resize",()=>{ if(state.view==="tree") renderTree(); });
+buildSources();
 render();
 </script>
 </body>
@@ -495,14 +899,18 @@ render();
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="WinDirStat for your Steam library.")
+    ap = argparse.ArgumentParser(description="WinDirStat for your game library — all launchers.")
     ap.add_argument("-o", "--output", default=str(Path.home() / ".cache/gamestat/report.html"))
     ap.add_argument("--all", action="store_true", help="include Proton/runtimes/redistributables")
+    ap.add_argument("--only", default="", metavar="LAUNCHERS",
+                    help="comma-separated subset, e.g. steam,epic,lutris "
+                         f"(available: {','.join(['steam', *PROVIDERS])})")
     ap.add_argument("--no-open", action="store_true", help="don't open a browser")
     ap.add_argument("--json", action="store_true", help="print raw data as JSON and exit")
     args = ap.parse_args()
 
-    rows, meta = collect(include_tools=args.all)
+    only = {s.strip().lower() for s in args.only.split(",") if s.strip()} or None
+    rows, meta = collect(include_tools=args.all, only=only)
 
     if args.json:
         print(json.dumps({"games": rows, "meta": meta}, indent=2))
@@ -514,7 +922,11 @@ def main() -> None:
 
     gb = meta["total_size"] / 1024**3
     hrs = meta["total_playtime"] / 60
+    src = ", ".join(meta["sources"]) or "no launchers found"
     print(f"gamestat · {meta['count']} games · {gb:.1f} GB on disk · {hrs:.0f} h played")
+    print(f"launchers: {src}")
+    for e in meta["errors"]:
+        print(f"  ! {e}", file=sys.stderr)
     print(f"report → {out}")
     if not args.no_open:
         webbrowser.open(out.resolve().as_uri())

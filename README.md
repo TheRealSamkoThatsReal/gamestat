@@ -1,9 +1,9 @@
 # gamestat
 
-**A WinDirStat for your game library.** One command scans your installed Steam
-games and builds a slick, self-contained web report that ranks them from
-**most-played to least-played** and draws a **disk-usage treemap** — the
-WinDirStat homage, but for games.
+**A WinDirStat for your game library.** One command scans every game launcher it
+can find and builds a slick, self-contained web report that ranks your games by
+**playtime** and draws a **disk-usage treemap** — the WinDirStat homage, but for
+games, across all your stores at once.
 
 Zero dependencies. Pure Python standard library. Runs on **Linux, Windows, and
 macOS**.
@@ -13,15 +13,37 @@ macOS**.
 ## Two views
 
 - **▤ Ranked list** — every installed game, most → least played, with cover art,
-  playtime, size on disk, and "last played." Sort by *Most played / Biggest /
-  Recent / A–Z*, plus live search.
+  a per-launcher badge, playtime, size on disk, and "last played." Sort by
+  *Most played / Biggest / Recent / A–Z*, filter by launcher, plus live search.
 - **▦ Disk treemap** — each game is a rectangle **sized by disk usage** and
-  **colored by playtime** (dim blue → cyan → magenta = more hours). Hover to
-  highlight.
+  **colored by playtime** (dim blue → cyan → magenta = more hours), with a
+  launcher-colored accent. Hover to highlight.
 
-The report is a single HTML file with a neon-noir theme. Cover art loads from
-Steam's CDN by appid, so there's no fragile local-cache mapping (and it falls
-back to solid heat-colored tiles offline).
+The report is a single HTML file with a neon-noir theme. Cover art comes from
+each store's artwork (Steam/Epic CDN, Lutris local covers); games without art
+get a clean initials placeholder.
+
+## Supported launchers
+
+`gamestat` measures **disk usage for every launcher** (from its manifest, or by
+walking the install folder). **Playtime is only available where the launcher
+records it locally** — everything else ranks by size / recency and shows "—".
+
+| Launcher | Disk size | Playtime | How it's found |
+|----------|:---------:|:--------:|----------------|
+| **Steam** | ✅ | ✅ | `appmanifest_*.acf` + `localconfig.vdf` |
+| **Lutris** (Linux) | ✅ | ✅ | `pga.db` (SQLite) |
+| **Epic** | ✅ | — | Windows manifests · Heroic/Legendary on Linux |
+| **GOG** | ✅ | — | Windows registry · Heroic on Linux |
+| **Amazon Games** | ✅ | — | Heroic/Nile on Linux |
+| **EA** | ✅ | — | Windows uninstall registry |
+| **Ubisoft Connect** | ✅ | — | Windows registry |
+| **Battle.net** | ✅ | — | Windows uninstall registry |
+| **Riot** | ✅ | — | `RiotClientInstalls.json` |
+
+Steam and Lutris paths are live-tested; the Windows-native launcher scanners use
+documented install locations and fail safe (a launcher that isn't present, or a
+format that doesn't parse, is simply skipped — it never crashes the report).
 
 ## Install
 
@@ -51,40 +73,40 @@ python3 gamestat.py
 ## Usage
 
 ```
-gamestat              # scan → write report → open in browser
-gamestat --no-open    # just write the report, print its path
-gamestat --all        # include Proton / runtimes / redistributables
-gamestat --json       # print the raw scan data as JSON
-gamestat -o FILE      # choose the output path
+gamestat                   # scan → write report → open in browser
+gamestat --no-open         # just write the report, print its path
+gamestat --all             # include Proton / runtimes / redistributables
+gamestat --only steam,epic # limit to specific launchers
+gamestat --json            # print the raw scan data as JSON
+gamestat -o FILE           # choose the output path
 ```
 
 The report is written to `~/.cache/gamestat/report.html` by default.
 
 ## How it works
 
-Everything comes from Steam's own local files — no login, no API keys:
+Everything comes from each launcher's own local files — no logins, no API keys.
+Each launcher is a small independent scanner that returns a normalized record
+(`source, name, size, playtime, last_played, art`); a bad or missing launcher is
+skipped, never fatal. Disk size is read from a manifest when the launcher
+provides one, otherwise measured by walking the install directory (metadata
+only). Games that appear under more than one launcher are de-duplicated, keeping
+the richest record.
 
-- `libraryfolders.vdf` → every library folder (across all your drives)
-- `appmanifest_*.acf` → installed game name, `SizeOnDisk`, `LastPlayed`
-- `userdata/*/config/localconfig.vdf` → `Playtime` (minutes), summed across all
-  local users
-
-Proton, Steam Linux Runtime, and redistributables are filtered out by default
-(pass `--all` to include them).
-
-Steam is located automatically: standard paths plus Flatpak/Snap on Linux, and
-the registry (`HKCU\Software\Valve\Steam`) on Windows.
+Launchers are located automatically — standard paths, Flatpak/Snap on Linux, and
+the Windows registry where relevant.
 
 ## Notes & limitations
 
-- Only reads what Steam records **locally** — playtime/last-played reflect this
-  machine's Steam data.
-- Currently Steam-only. Non-Steam launchers (Heroic, Lutris, Epic) aren't
-  scanned yet.
-- Cover art needs an internet connection; offline, tiles render as solid
-  heat-colored blocks.
+- **Playtime** is only shown for launchers that record it locally (Steam,
+  Lutris). Epic, GOG, EA, Ubisoft, Battle.net, Riot, and Amazon don't expose
+  local playtime, so those games rank by size / last-played and show "—".
+- Playtime/last-played reflect **this machine's** local data.
+- Cover art needs an internet connection for Steam/Epic titles; offline (or when
+  a title has no art) it falls back to a clean initials placeholder / heat tile.
+- Xbox / Microsoft Store games aren't scanned yet.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Cover art is © Valve/Steam, loaded from Steam's
-public CDN.
+MIT — see [LICENSE](LICENSE). Cover art is © the respective stores, loaded from
+their public CDNs (or your local launcher cache).
