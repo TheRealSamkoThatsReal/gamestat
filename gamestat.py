@@ -1037,7 +1037,9 @@ def cmd_app(argv: list[str]) -> None:
     api = Api(include_tools=args.all)
     webview.create_window("gamestat", html=html, js_api=api,
                           width=1280, height=820, min_size=(940, 600))
-    webview.start()
+    # Let pywebview auto-detect the native backend (WebView2 on Windows, WebKit
+    # on macOS, WebKitGTK on Linux). GAMESTAT_GUI can force one (gtk/qt/…).
+    webview.start(gui=os.environ.get("GAMESTAT_GUI") or None)
 
 
 # ---------------------------------------------------------------------------

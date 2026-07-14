@@ -49,8 +49,7 @@ format that doesn't parse, is simply skipped — it never crashes the report).
 
 ### Prebuilt downloads (no Python needed)
 
-Grab the latest for your OS from the [**Releases**](../../releases) page. These
-builds include the desktop app (`gamestat app`) — no `pip install` required.
+Grab the latest for your OS from the [**Releases**](../../releases) page.
 
 | OS | Recommended | Also available |
 |----|-------------|----------------|
@@ -59,14 +58,15 @@ builds include the desktop app (`gamestat app`) — no `pip install` required.
 | **macOS** (Apple Silicon) | `gamestat-macos-arm64` | — |
 
 - **Windows installer** — double-click; installs per-user (no admin prompt),
-  adds a Start-Menu shortcut, and optionally puts `gamestat` on your PATH.
-- **Linux tarball** — extract and run `./install.sh` to add it to `~/.local/bin`
-  with an app-menu entry, or just run the portable binary directly.
-- **macOS / portable binaries** — `chmod +x gamestat-*` then run.
-
-> The Linux desktop app uses your system's WebKitGTK (`webkit2gtk-4.1`), which
-> ships with essentially every modern desktop. Windows uses the built-in
-> WebView2 runtime (present on Windows 10/11).
+  adds a Start-Menu shortcut, optionally puts `gamestat` on your PATH. The
+  **desktop app is bundled** (uses the built-in WebView2 runtime).
+- **macOS** — `chmod +x gamestat-macos-arm64` then run. The **desktop app is
+  bundled** (uses the OS's built-in WebKit).
+- **Linux** — extract the tarball and run `./install.sh` (adds it to
+  `~/.local/bin` + an app-menu entry), or run the portable binary. The Linux
+  build is the **report + CLI**; the menu entry opens the report in your browser.
+  For the native `gamestat app` window, install pywebview (see below) — a browser
+  engine can't be bundled portably across Linux distros.
 
 ### From source
 
@@ -108,15 +108,22 @@ gamestat app          # native window
 gamestat app --all    # include runtimes
 ```
 
-Requires pywebview (the report and CLI don't):
+**Availability of the bundled app:**
 
-```
-pip install pywebview          # any OS
-sudo pacman -S python-pywebview  # Arch
-```
+- **Windows / macOS** — the desktop app is **built into the release binaries**
+  (they use the OS's built-in WebView2 / WebKit, so nothing extra to install).
+- **Linux** — `gamestat app` needs pywebview + your distro's WebKitGTK, because a
+  browser engine isn't portable enough to bundle into a single cross-distro
+  binary. Install it once, then run `gamestat app`:
 
-The prebuilt release binaries include the report + CLI; run `app` mode from
-source (or a `pip`/`pacman` install) so it can pick up your system's webview.
+  ```
+  sudo pacman -S python-pywebview      # Arch / CachyOS
+  sudo apt install python3-webview     # Debian / Ubuntu
+  pip install pywebview                # anywhere (needs system WebKitGTK)
+  ```
+
+  Without it, the Linux menu entry and `gamestat` open the same report in your
+  browser — every feature except the in-window uninstall buttons.
 
 ## Uninstalling games
 
