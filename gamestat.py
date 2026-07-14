@@ -14,6 +14,7 @@ recency and show "—" for playtime.
 
 Usage:
     gamestat                     # scan, write report, open in browser
+    gamestat app                 # native desktop window w/ uninstall buttons (needs pywebview)
     gamestat --no-open           # just write the report, print its path
     gamestat --all               # include Proton / runtimes / redistributables
     gamestat --only steam,epic   # limit to specific launchers
@@ -219,9 +220,11 @@ def rec(source: str, name: str, size, playtime_min=0, has_playtime=False,
         last_played=0, *, art="", appid=0, tool=False, install_dir="",
         app_name="", uninstall_cmd="", cloud=False) -> dict:
     """Normalized game record shared by every provider."""
+    nm = name.strip() or "Unknown"
     return {
+        "uid": f"{source}:{appid or nm}",            # stable id for the app API
         "source": source,
-        "name": name.strip() or "Unknown",
+        "name": nm,
         "size": int(size or 0),
         "playtime": int(playtime_min or 0),          # minutes
         "has_playtime": bool(has_playtime),
@@ -939,11 +942,102 @@ def cmd_uninstall(argv: list[str]) -> None:
             return
 
     freed = remove_paths(plan["paths"], dry_run=False)
+    _post_uninstall(g)
+    print(f"\nDone. Freed {fmt_bytes(freed)}.")
+
+
+def _post_uninstall(g: dict) -> None:
+    """Launcher bookkeeping after files are removed."""
     if g["source"] == "Lutris":
         _lutris_mark_uninstalled(g["app_name"])
     elif g["source"] in ("Epic", "GOG", "Amazon"):
         _heroic_forget(g["source"], g["app_name"])
-    print(f"\nDone. Freed {fmt_bytes(freed)}.")
+
+
+# ---------------------------------------------------------------------------
+# Desktop app (pywebview) — native window with action buttons
+# ---------------------------------------------------------------------------
+
+class Api:
+    """Methods exposed to the page as window.pywebview.api.<method>(). pywebview
+    marshals args/returns as JSON. This bridge is local-only (no HTTP port), so
+    there's no CSRF surface — a webpage can't reach it."""
+
+    def __init__(self, include_tools: bool = False):
+        self.include_tools = include_tools
+
+    def _find(self, uid: str) -> dict | None:
+        rows, _ = collect(include_tools=self.include_tools)
+        return next((g for g in rows if g["uid"] == uid), None)
+
+    def scan(self) -> dict:
+        rows, meta = collect(include_tools=self.include_tools)
+        return {"games": rows, "meta": meta}
+
+    def plan(self, uid: str, keep_compat=False, remove_prefix=False) -> dict:
+        g = self._find(uid)
+        if not g:
+            return {"error": "Game not found (already removed?)."}
+        p = build_plan(g, keep_compat=keep_compat, remove_prefix=remove_prefix)
+        return {
+            "name": g["name"], "source": g["source"], "size": g["size"],
+            "reclaim": p["reclaim"], "cloud": p["cloud"], "notes": p["notes"],
+            "paths": [str(x) for x in p["paths"]],
+            "running": launcher_running(g["source"]),
+        }
+
+    def uninstall(self, uid: str, keep_compat=False, remove_prefix=False,
+                  force=False) -> dict:
+        g = self._find(uid)
+        if not g:
+            return {"ok": False, "error": "Game not found."}
+        if not force and launcher_running(g["source"]):
+            return {"ok": False, "error": f"{g['source']} is running — close it first."}
+        p = build_plan(g, keep_compat=keep_compat, remove_prefix=remove_prefix)
+        try:
+            freed = remove_paths(p["paths"], dry_run=False)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        _post_uninstall(g)
+        return {"ok": True, "freed": freed, "name": g["name"]}
+
+    def launch(self, uid: str) -> dict:
+        g = self._find(uid)
+        if g and g["source"] == "Steam" and g["appid"]:
+            webbrowser.open(f"steam://run/{g['appid']}")
+            return {"ok": True}
+        return {"ok": False, "error": "Launch is only wired up for Steam."}
+
+    def store_page(self, uid: str) -> dict:
+        g = self._find(uid)
+        if g and g["source"] == "Steam" and g["appid"]:
+            webbrowser.open(f"https://store.steampowered.com/app/{g['appid']}")
+            return {"ok": True}
+        return {"ok": False}
+
+
+def cmd_app(argv: list[str]) -> None:
+    ap = argparse.ArgumentParser(
+        prog="gamestat app",
+        description="Native desktop window with uninstall / launch buttons.")
+    ap.add_argument("--all", action="store_true",
+                    help="include Proton/runtimes/redistributables")
+    args = ap.parse_args(argv)
+    try:
+        import webview  # noqa: PLC0415
+    except ImportError:
+        sys.exit(
+            "The desktop app needs pywebview:\n"
+            "  pip install pywebview        (any OS)\n"
+            "  pacman -S python-pywebview   (Arch)\n"
+            "The report and CLI work without it.")
+
+    rows, meta = collect(include_tools=args.all)
+    html = render(rows, meta)
+    api = Api(include_tools=args.all)
+    webview.create_window("gamestat", html=html, js_api=api,
+                          width=1280, height=820, min_size=(940, 600))
+    webview.start()
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1097,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* ---- ranked list ---- */
   #list{display:grid;gap:9px}
   .row{
-    display:grid;grid-template-columns:34px 90px 1fr 128px 110px 92px;gap:14px;align-items:center;
+    display:grid;grid-template-columns:34px 90px 1fr 128px 96px 88px 76px;gap:14px;align-items:center;
     background:linear-gradient(90deg,var(--panel),var(--bg2));border:1px solid var(--line);
     border-radius:12px;padding:9px 14px 9px 10px;box-shadow:var(--shadow);position:relative;overflow:hidden;
   }
@@ -1053,6 +1147,41 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .hide{display:none!important}
   .empty{color:var(--dim);text-align:center;padding:60px}
   footer{color:var(--dim);font-size:11px;padding:0 26px 30px}
+
+  /* ---- app-mode action buttons ---- */
+  .acts{display:flex;gap:6px;justify-content:flex-end}
+  body:not(.app) .acts{display:none}          /* only in the desktop app */
+  body:not(.app) .row{grid-template-columns:34px 90px 1fr 128px 110px 92px}
+  .abtn{background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;
+    width:30px;height:30px;font-size:14px;cursor:pointer;display:grid;place-items:center;transition:all .12s}
+  .abtn:hover{color:#eaf6ff;border-color:var(--cyan)}
+  .abtn.danger:hover{color:#fff;border-color:var(--mag);background:rgba(255,59,212,.14)}
+
+  /* ---- modal ---- */
+  .scrim{position:fixed;inset:0;background:rgba(4,8,14,.72);backdrop-filter:blur(3px);
+    display:none;align-items:center;justify-content:center;z-index:50}
+  .scrim.on{display:flex}
+  .modal{width:min(560px,92vw);background:linear-gradient(180deg,var(--panel),var(--bg2));
+    border:1px solid var(--line);border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.6);overflow:hidden}
+  .modal h2{margin:0;padding:18px 20px 12px;font-size:18px;display:flex;align-items:center;gap:10px}
+  .modal .body{padding:4px 20px 8px;max-height:56vh;overflow:auto}
+  .kv{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line);font-size:13px}
+  .kv .v{color:#eaf6ff;font-variant-numeric:tabular-nums}
+  .cloudok{color:#66c0f4} .warn{color:#ffcf6b}
+  .paths{margin:10px 0 4px;font-size:11px;color:var(--dim);max-height:120px;overflow:auto;
+    background:#0b1420;border:1px solid var(--line);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all}
+  .opt{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px;margin-top:8px;cursor:pointer}
+  .modal .foot{display:flex;gap:10px;justify-content:flex-end;padding:14px 20px 18px}
+  .mbtn{border:1px solid var(--line);background:transparent;color:var(--txt);border-radius:10px;
+    padding:9px 16px;font:inherit;font-size:13px;cursor:pointer}
+  .mbtn.go{border-color:var(--mag);color:#fff;background:linear-gradient(180deg,rgba(255,59,212,.25),rgba(255,59,212,.1))}
+  .mbtn:disabled{opacity:.45;cursor:not-allowed}
+  /* ---- toast ---- */
+  #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
+    background:var(--panel);border:1px solid var(--line);color:var(--txt);padding:11px 18px;border-radius:12px;
+    box-shadow:var(--shadow);opacity:0;transition:all .25s;z-index:60;font-size:13px;pointer-events:none}
+  #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  #toast.err{border-color:var(--mag);color:#ffd0f0}
 </style>
 </head>
 <body>
@@ -1096,6 +1225,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </main>
 <footer id="foot"></footer>
+
+<div class="scrim" id="scrim">
+  <div class="modal">
+    <h2 id="m-title">Uninstall</h2>
+    <div class="body" id="m-body"></div>
+    <div class="foot">
+      <button class="mbtn" id="m-cancel">Cancel</button>
+      <button class="mbtn go" id="m-go">Uninstall</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
 
 <script>
 const DATA = /*__DATA__*/;
@@ -1169,6 +1310,10 @@ function renderList(){
       <div class="col pt">${pt}</div>
       <div class="col">${fmtSize(x.size)}</div>
       <div class="col muted">${fmtDate(x.last_played)}</div>
+      <div class="acts">
+        ${x.source==='Steam'&&x.appid?`<button class="abtn" title="Launch" onclick="api_launch('${esc(x.uid)}')">▶</button>`:''}
+        <button class="abtn danger" title="Uninstall" onclick="openUninstall('${esc(x.uid)}')">🗑</button>
+      </div>
     </div>`;
   }).join("");
 }
@@ -1251,6 +1396,69 @@ $("#sort").onclick=e=>{const b=e.target.closest("button"); if(!b)return;
 $("#q").oninput=e=>{state.q=e.target.value.trim(); render();};
 $("#tools").onchange=e=>{state.tools=e.target.checked; render();};
 addEventListener("resize",()=>{ if(state.view==="tree") renderTree(); });
+
+/* ---------- desktop-app actions (only active under pywebview) ---------- */
+let APP=false, modalUid=null;
+function toast(msg, err){ const t=$("#toast"); t.textContent=msg; t.classList.toggle("err",!!err);
+  t.classList.add("on"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("on"), 3200); }
+
+async function api_launch(uid){ try{ const r=await window.pywebview.api.launch(uid);
+  toast(r.ok?"Launching…":(r.error||"Can't launch"), !r.ok); }catch(e){ toast(""+e,true); } }
+
+async function openUninstall(uid){
+  modalUid=uid;
+  const g = DATA.games.find(x=>x.uid===uid) || {name:"game"};
+  $("#m-title").innerHTML = `🗑 Uninstall <span style="color:${srcColor(g.source)}">${esc(g.name)}</span>`;
+  $("#m-body").innerHTML = `<div class="kv"><span>Computing plan…</span></div>`;
+  $("#m-go").disabled = true;
+  $("#scrim").classList.add("on");
+  await refreshPlan();
+}
+
+async function refreshPlan(){
+  const keep = $("#opt-keep")?.checked || false;
+  const rmp  = $("#opt-rmp")?.checked || false;
+  let p; try{ p = await window.pywebview.api.plan(modalUid, keep, rmp); }
+  catch(e){ $("#m-body").innerHTML=`<div class="warn">Error: ${esc(""+e)}</div>`; return; }
+  if(p.error){ $("#m-body").innerHTML=`<div class="warn">${esc(p.error)}</div>`; return; }
+  const cloud = p.cloud||{};
+  const cloudLine = p.source==="Steam"
+    ? (cloud.has_cloud ? `<span class="cloudok">☁ yes (${cloud.files} files) — save safe</span>`
+                       : `<span class="warn">none detected</span>`) : "n/a";
+  const steamOpts = p.source==="Steam" ? `
+    <label class="opt"><input type="checkbox" id="opt-keep" ${$("#opt-keep")?.checked?"checked":""}> keep Proton prefix (--keep-compat)</label>
+    ${!cloud.has_cloud?`<label class="opt"><input type="checkbox" id="opt-rmp" ${$("#opt-rmp")?.checked?"checked":""}> also delete Proton prefix (may hold local saves)</label>`:""}` : "";
+  $("#m-body").innerHTML = `
+    <div class="kv"><span>Launcher</span><span class="v">${esc(p.source)}</span></div>
+    <div class="kv"><span>Reclaimable</span><span class="v">${fmtSize(p.reclaim)}</span></div>
+    <div class="kv"><span>Cloud save</span><span class="v">${cloudLine}</span></div>
+    ${p.running?`<div class="kv warn"><span>⚠ ${esc(p.source)} is running</span><span class="v">close it first</span></div>`:""}
+    ${p.notes.map(n=>`<div class="opt">• ${esc(n)}</div>`).join("")}
+    <div class="paths">${p.paths.map(esc).join("\n")||"(nothing to remove)"}</div>
+    ${steamOpts}`;
+  $("#m-go").disabled = !!p.running;
+  const kb=$("#opt-keep"), rb=$("#opt-rmp");
+  if(kb) kb.onchange=refreshPlan; if(rb) rb.onchange=refreshPlan;
+}
+
+async function refresh(){ const d=await window.pywebview.api.scan();
+  DATA.games=d.games; DATA.meta=d.meta; state.sources=new Set(DATA.meta.sources); render(); }
+
+$("#m-cancel").onclick=()=>$("#scrim").classList.remove("on");
+$("#scrim").onclick=e=>{ if(e.target===$("#scrim")) $("#scrim").classList.remove("on"); };
+$("#m-go").onclick=async ()=>{
+  const keep=$("#opt-keep")?.checked||false, rmp=$("#opt-rmp")?.checked||false;
+  $("#m-go").disabled=true; $("#m-go").textContent="Removing…";
+  try{
+    const r=await window.pywebview.api.uninstall(modalUid, keep, rmp);
+    if(r.ok){ toast(`Uninstalled ${r.name} — freed ${fmtSize(r.freed)}`); await refresh(); }
+    else toast(r.error||"Failed", true);
+  }catch(e){ toast(""+e,true); }
+  $("#m-go").disabled=false; $("#m-go").textContent="Uninstall";
+  $("#scrim").classList.remove("on");
+};
+window.addEventListener("pywebviewready", ()=>{ APP=true; document.body.classList.add("app"); render(); });
+
 buildSources();
 render();
 </script>
@@ -1266,10 +1474,13 @@ def main() -> None:
     argv = sys.argv[1:]
     if argv and argv[0] == "uninstall":
         return cmd_uninstall(argv[1:])
+    if argv and argv[0] == "app":
+        return cmd_app(argv[1:])
 
     ap = argparse.ArgumentParser(
         description="WinDirStat for your game library — all launchers.",
-        epilog="subcommands: uninstall <game>  — remove a game via its launcher")
+        epilog="subcommands: app — native window w/ buttons · "
+               "uninstall <game> — remove a game via its launcher")
     ap.add_argument("-o", "--output", default=str(Path.home() / ".cache/gamestat/report.html"))
     ap.add_argument("--all", action="store_true", help="include Proton/runtimes/redistributables")
     ap.add_argument("--only", default="", metavar="LAUNCHERS",

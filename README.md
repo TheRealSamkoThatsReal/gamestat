@@ -83,6 +83,33 @@ gamestat -o FILE           # choose the output path
 
 The report is written to `~/.cache/gamestat/report.html` by default.
 
+## Desktop app (with buttons)
+
+`gamestat app` opens a **native desktop window** (via
+[pywebview](https://pywebview.flowrl.com/) — uses your OS's built-in webview, no
+Chromium bundle) with the same report plus **per-row action buttons**: 🗑
+uninstall and ▶ launch (Steam). The uninstall button opens a confirmation modal
+showing the exact plan — reclaimable size, cloud-save status, the files to be
+removed, and Steam prefix options — then removes the game and refreshes live.
+
+Because the page talks to Python over pywebview's local JS↔Python bridge (not an
+HTTP port), there's **no CSRF surface** — a random webpage can't reach it.
+
+```
+gamestat app          # native window
+gamestat app --all    # include runtimes
+```
+
+Requires pywebview (the report and CLI don't):
+
+```
+pip install pywebview          # any OS
+sudo pacman -S python-pywebview  # Arch
+```
+
+The prebuilt release binaries include the report + CLI; run `app` mode from
+source (or a `pip`/`pacman` install) so it can pick up your system's webview.
+
 ## Uninstalling games
 
 `gamestat uninstall "<game>"` removes a game through its launcher's real
