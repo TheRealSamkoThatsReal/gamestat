@@ -10,6 +10,31 @@ macOS**.
 
 ---
 
+## Screenshots
+
+### Desktop app
+
+The `gamestat app` window (same UI on Windows, macOS, and Linux) — a ranked list
+with launcher badges and per-row **launch / uninstall** buttons, a disk-usage
+treemap, and a cloud-save-aware uninstall dialog.
+
+![gamestat desktop app — ranked list](docs/app-list.png)
+
+![gamestat desktop app — disk treemap](docs/app-treemap.png)
+
+![gamestat desktop app — uninstall confirmation](docs/app-uninstall.png)
+
+### Terminal UI (`gamestat-tui`)
+
+A native ratatui TUI for the terminal — source colors, ☁ cloud markers,
+disk-usage bars, and the same guarded uninstall, in-terminal.
+
+![gamestat-tui — ranked list](docs/tui.png)
+
+![gamestat-tui — uninstall confirmation](docs/tui-uninstall.png)
+
+---
+
 ## Two views
 
 - **▤ Ranked list** — every installed game, most → least played, with cover art,

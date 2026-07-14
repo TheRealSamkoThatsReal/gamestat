@@ -637,13 +637,52 @@ fn selftest(keys: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn sgr(fg: Color, bg: Color) -> String {
+    fn code(c: Color, base: u8) -> String {
+        match c {
+            Color::Rgb(r, g, b) => format!("\x1b[{};2;{r};{g};{b}m", base + 8),
+            Color::White => format!("\x1b[{}m", base + 7),
+            Color::DarkGray => format!("\x1b[{};2;110;110;110m", base + 8),
+            _ => String::new(),
+        }
+    }
+    format!("\x1b[0m{}{}", code(fg, 30), code(bg, 40))
+}
+
+/// Render a frame and emit it as ANSI (for piping into `aha` → HTML → image).
+fn ansi(keys: &str) -> Result<(), String> {
+    let games = load_games()?;
+    let mut app = App::new(games);
+    for c in keys.chars() {
+        on_key(&mut app, KeyCode::Char(c));
+    }
+    let backend = TestBackend::new(96, if app.confirm.is_some() { 26 } else { 20 });
+    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
+    terminal.draw(|f| ui(f, &mut app)).map_err(|e| e.to_string())?;
+    let buf = terminal.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            out.push_str(&sgr(cell.fg, cell.bg));
+            out.push_str(cell.symbol());
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let result = if args.iter().any(|a| a == "--selftest") {
-        let keys = args
-            .iter()
-            .find_map(|a| a.strip_prefix("--keys="))
-            .unwrap_or("");
+    let keys = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--keys="))
+        .unwrap_or("");
+    let result = if args.iter().any(|a| a == "--ansi") {
+        ansi(keys)
+    } else if args.iter().any(|a| a == "--selftest") {
         selftest(keys)
     } else if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
