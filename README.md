@@ -78,13 +78,15 @@ Grab the latest for your OS from the [**Releases**](../../releases) page.
 
 | OS | Recommended | Also available |
 |----|-------------|----------------|
-| **Windows** | `gamestat-setup-x64.exe` (installer — Start-Menu entry, optional PATH) | `gamestat-windows-x86_64.exe` (portable) |
+| **Windows** | `gamestat-setup-x64.exe` (installer — Start-Menu entry, optional PATH) | `gamestat-app-windows-x86_64.exe` (portable GUI), `gamestat-windows-x86_64.exe` (portable CLI) |
 | **Linux** | `gamestat-linux-x86_64.tar.gz` (binary + `install.sh` + menu entry) | `gamestat-linux-x86_64` (portable binary) |
 | **macOS** (Apple Silicon) | `gamestat-macos-arm64` | — |
 
 - **Windows installer** — double-click; installs per-user (no admin prompt),
   adds a Start-Menu shortcut, optionally puts `gamestat` on your PATH. The
-  **desktop app is bundled** (uses the built-in WebView2 runtime).
+  **desktop app is bundled** (uses the built-in WebView2 runtime). There are two
+  exes: `gamestat.exe` (console — for the CLI) and `gamestat-app.exe` (windowed —
+  the shortcut uses this so the app opens with **no command-prompt window**).
 - **macOS** — `chmod +x gamestat-macos-arm64` then run. The **desktop app is
   bundled** (uses the OS's built-in WebKit).
 - **Linux** — extract the tarball and run `./install.sh` (adds it to

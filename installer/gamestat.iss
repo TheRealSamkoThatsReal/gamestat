@@ -6,6 +6,7 @@
   #define MyAppVersion "0.0.0"
 #endif
 #define MyAppExe "gamestat.exe"
+#define MyAppGuiExe "gamestat-app.exe"
 #define MyAppPublisher "TheRealSamkoThatsReal"
 #define MyAppURL "https://github.com/TheRealSamkoThatsReal/gamestat"
 
@@ -40,13 +41,15 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "dist\{#MyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\{#MyAppGuiExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\gamestat"; Filename: "{app}\{#MyAppExe}"; Parameters: "app"; Comment: "Game library dashboard"
-Name: "{autodesktop}\gamestat"; Filename: "{app}\{#MyAppExe}"; Parameters: "app"; Tasks: desktopicon
+; Shortcuts launch the windowed exe so no command prompt appears.
+Name: "{autoprograms}\gamestat"; Filename: "{app}\{#MyAppGuiExe}"; Parameters: "app"; Comment: "Game library dashboard"
+Name: "{autodesktop}\gamestat"; Filename: "{app}\{#MyAppGuiExe}"; Parameters: "app"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExe}"; Parameters: "app"; Description: "Launch gamestat now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppGuiExe}"; Parameters: "app"; Description: "Launch gamestat now"; Flags: nowait postinstall skipifsilent
 
 [Registry]
 ; Append install dir to the per-user PATH (HKCU under lowest privileges).

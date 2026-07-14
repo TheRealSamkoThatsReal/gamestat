@@ -57,12 +57,21 @@ jobs:
         run: python -m PyInstaller --onefile --noconfirm --name gamestat
              --collect-all webview gamestat.py
 
+      # A second, windowed (no-console) exe for the GUI, so launching the app
+      # doesn't pop a command prompt. gamestat.exe stays console for the CLI.
+      - name: Windows — build windowed app exe
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python -m PyInstaller --onefile --noconfirm --windowed --name gamestat-app
+             --icon packaging/assets/icon.ico --collect-all webview gamestat.py
+
       - name: Stage raw binary
         shell: bash
         run: |
           mkdir -p out
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp dist/gamestat.exe "out/${{ matrix.asset }}"
+            cp dist/gamestat-app.exe "out/gamestat-app-windows-x86_64.exe"
           else
             cp dist/gamestat "out/${{ matrix.asset }}"
           fi
